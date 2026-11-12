@@ -688,7 +688,7 @@ async function doLogin() {
    ===================================================================== */
 const A = {
   user: null, folders: [], docs: [], trash: [], purging: false,
-  view: 'inbox',            // 'inbox' | 'all' | 'unfiled' | 'rejected' | <folder uuid>
+  view: 'inbox',            // 'inbox' | 'all' | 'unfiled' | 'trash' | <folder uuid>
   sel: null, search: '', from: '', to: '',
   expanded: new Set(), dragId: null, urlCache: {}, channel: null, mounted: false,
   mode: 'list', tab: 'list', hideSide: false, hideList: false, thumbs: {}, statPrev: { archived: 0, pending: 0 },
@@ -767,6 +767,12 @@ async function loadAll(silent = false) {
     sb.from('documents').select('*').order('created_at', { ascending: false }),
   ]);
   if (f.error || d.error) return toast((f.error || d.error).message, 'error');
+  const legacy = d.data.filter(x => x.status === 'rejected' && !x.deleted_at);
+  if (legacy.length) {
+    const now = new Date().toISOString();
+    const { error } = await sb.from('documents').update({ deleted_at: now }).in('id', legacy.map(x => x.id));
+    if (!error) legacy.forEach(x => { x.deleted_at = now; });
+  }
   A.folders = f.data;
   A.docs  = d.data.filter(x => !x.deleted_at);
   A.trash = d.data.filter(x => x.deleted_at).sort((a, b) => new Date(b.deleted_at) - new Date(a.deleted_at));
@@ -784,7 +790,6 @@ function visibleDocs() {
   else if (v === 'inbox') l = l.filter(d => d.status === 'pending');
   else if (v === 'all') l = l.filter(d => d.status === 'archived');
   else if (v === 'unfiled') l = l.filter(d => d.status === 'archived' && !d.folder_id);
-  else if (v === 'rejected') l = l.filter(d => d.status === 'rejected');
   else { const ids = descendants(v); l = l.filter(d => d.status === 'archived' && ids.includes(d.folder_id)); }
 
   const q = A.search.trim().toLowerCase();
@@ -875,13 +880,11 @@ function renderSide() {
   const pending  = A.docs.filter(d => d.status === 'pending').length;
   const archived = A.docs.filter(d => d.status === 'archived').length;
   const unfiled  = A.docs.filter(d => d.status === 'archived' && !d.folder_id).length;
-  const rejected = A.docs.filter(d => d.status === 'rejected').length;
   $('#side').innerHTML = `
     <div class="space-y-0.5">
       ${navItem('inbox', 'inbox', 'Inbox', pending)}
       ${navItem('all', 'library', 'Semua arsip', archived)}
       ${navItem('unfiled', 'folder-minus', 'Tanpa folder', unfiled)}
-      ${navItem('rejected', 'ban', 'Ditolak', rejected)}
       ${navItem('trash', 'trash-2', 'Sampah', A.trash.length)}
     </div>
     <div class="flex items-center justify-between mt-5 mb-1 px-2.5">
@@ -900,11 +903,11 @@ function actions(d, big = false) {
   if (d.deleted_at)            return prev + b('untrash', 'undo-2', 'Pulihkan', 'bg-tint-50 text-ink hover:bg-tint-100') + b('purge', 'trash-2', 'Hapus permanen', 'bg-red-50 text-stamp hover:bg-red-100');
   if (d.status === 'pending')  return prev + b('approve', 'check-check', 'Setujui & Arsipkan', 'bg-ink text-white hover:bg-ink-soft') + edit + b('reject', 'x', 'Tolak', 'bg-red-50 text-stamp hover:bg-red-100');
   if (d.status === 'archived') return prev + b('move', 'folder-input', 'Pindahkan', 'bg-tint-50 text-ink hover:bg-tint-100') + edit + b('delete', 'trash-2', 'Hapus', 'bg-red-50 text-stamp hover:bg-red-100');
-  return prev + b('restore', 'undo-2', 'Kembalikan ke Inbox', 'bg-tint-50 text-ink hover:bg-tint-100') + edit + b('delete', 'trash-2', 'Hapus', 'bg-red-50 text-stamp hover:bg-red-100');
+  return prev + edit + b('delete', 'trash-2', 'Hapus', 'bg-red-50 text-stamp hover:bg-red-100');
 }
 
 function viewTitle() {
-  return { inbox:'Inbox', all:'Semua arsip', unfiled:'Arsip tanpa folder', rejected:'Berkas ditolak', trash:'Sampah' }[A.view]
+  return { inbox:'Inbox', all:'Semua arsip', unfiled:'Arsip tanpa folder', trash:'Sampah' }[A.view]
     || `<span class="inline-flex items-center gap-1.5">${ic('folder-open', 'w-4 h-4 text-amber-600')}${esc(folderPath(A.view))}</span>`;
 }
 
@@ -1102,12 +1105,16 @@ async function archiveDoc(id, folderId) {
   } catch (e) { toast(e.message || 'Gagal mengarsipkan', 'error'); }
 }
 
-async function setStatus(id, status) {
-  const { error } = await sb.from('documents').update({ status }).eq('id', id);
+async function rejectDoc(id) {   // Tolak = status 'rejected' + langsung ke Sampah (tidak ada menu Ditolak lagi)
+  const d = docById(id); if (!d) return;
+  if (!await confirmBox({ title: 'Tolak berkas ini?', text: `"${d.title}" dipindahkan ke Sampah dan dihapus permanen otomatis setelah ${TRASH_DAYS} hari. Pengirim akan melihat status "Ditolak" saat cek resi.`, ok: 'Tolak berkas', danger: true })) return;
+  const deleted_at = new Date().toISOString();
+  const { error } = await sb.from('documents').update({ status: 'rejected', deleted_at }).eq('id', id);
   if (error) return toast(error.message, 'error');
-  docById(id).status = status;
-  toast(status === 'rejected' ? 'Berkas ditolak' : 'Berkas dikembalikan ke Inbox');
-  renderAll();
+  A.docs = A.docs.filter(x => x.id !== id);
+  A.trash.unshift(Object.assign(d, { status: 'rejected', deleted_at }));
+  if (A.sel === id) A.sel = null;
+  toast('Berkas ditolak dan dipindahkan ke Sampah'); renderAll();
 }
 
 async function deleteDoc(id) {   // pindah ke Sampah (bisa dipulihkan selama TRASH_DAYS hari)
@@ -1124,10 +1131,11 @@ async function deleteDoc(id) {   // pindah ke Sampah (bisa dipulihkan selama TRA
 
 async function untrashDoc(id) {
   const d = docById(id); if (!d) return;
-  const { error } = await sb.from('documents').update({ deleted_at: null }).eq('id', id);
+  const patch = d.status === 'rejected' ? { deleted_at: null, status: 'pending' } : { deleted_at: null };
+  const { error } = await sb.from('documents').update(patch).eq('id', id);
   if (error) return toast(error.message, 'error');
   A.trash = A.trash.filter(x => x.id !== id);
-  d.deleted_at = null; A.docs.unshift(d); A.docs.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+  Object.assign(d, patch); A.docs.unshift(d); A.docs.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
   toast('Berkas dipulihkan'); renderAll();
 }
 
@@ -1304,8 +1312,7 @@ document.addEventListener('click', async e => {
     case 'approve': openFolderPicker(id, 'approve'); break;
     case 'move':    openFolderPicker(id, 'move'); break;
     case 'do-archive': { const fid = $('#pick-folder').value; closeModal(); archiveDoc(id, fid); break; }
-    case 'reject':  if (await confirmBox({ title: 'Tolak berkas ini?', text: 'Berkas dipindah ke daftar "Ditolak" dan bisa dikembalikan atau dihapus kapan saja.', ok: 'Tolak berkas', danger: true })) setStatus(id, 'rejected'); break;
-    case 'restore': setStatus(id, 'pending'); break;
+    case 'reject':  rejectDoc(id); break;
     case 'delete':  deleteDoc(id); break;
     case 'untrash': untrashDoc(id); break;
     case 'purge':   purgeDoc(id); break;
